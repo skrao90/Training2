@@ -1,4 +1,4 @@
-.cards > ul {
+.sridhar > ul {
   list-style: none;
   margin: 0;
   padding: 0;
@@ -7,21 +7,21 @@
   gap: 24px;
 }
 
-.cards > ul > li {
+.sridhar > ul > li {
   border: 1px solid #dadada;
   background-color: var(--background-color);
 }
 
-.cards .cards-card-body {
+.sridhar .sridhar-sridhar-body {
   margin: 16px;
   background-color: #333333;
 }
 
-.cards .cards-card-image {
+.sridhar .sridhar-sridhar-image {
   line-height: 0;
 }
 
-.cards > ul > li img {
+.sridhar > ul > li img {
   width: 100%;
   aspect-ratio: 4 / 3;
   object-fit: cover;
