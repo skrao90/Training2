@@ -1,268 +1,339 @@
 /**
- * Adobe EDS Login Block
- * Renders a login form with email/password fields and handles authentication.
+ * Adobe EDS — Login Gmail Block
  *
- * Block Table Structure (in document):
- * | Login          |
- * | action         | /api/login (optional)
- * | redirect       | /dashboard (optional)
- * | title          | Welcome Back (optional)
- * | subtitle       | Sign in to continue (optional)
+ * Authenticates users via Google OAuth 2.0 (popup or redirect flow).
+ * Optionally validates that the signed-in account uses a specific domain.
+ *
+ * Block table structure (in Google Doc / SharePoint):
+ * ┌─────────────────┬──────────────────────────────────────────┐
+ * │ Login Gmail     │                                          │
+ * ├─────────────────┼──────────────────────────────────────────┤
+ * │ clientid        │ YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com │
+ * │ redirect        │ /dashboard                               │
+ * │ scope           │ openid email profile                     │
+ * │ hd              │ mycompany.com  (optional hosted domain)  │
+ * │ flow            │ popup  OR  redirect  (default: popup)    │
+ * │ title           │ Welcome                                  │
+ * │ subtitle        │ Sign in with your Google account         │
+ * │ buttonlabel     │ Continue with Google                     │
+ * └─────────────────┴──────────────────────────────────────────┘
  */
 
-function showError(form, message) {
-  let errorEl = form.querySelector('.login-error');
-  if (!errorEl) {
-    errorEl = document.createElement('p');
-    errorEl.className = 'login-error';
-    form.prepend(errorEl);
-  }
-  errorEl.textContent = message;
-  errorEl.setAttribute('role', 'alert');
-}
-
-function clearError(form) {
-  const errorEl = form.querySelector('.login-error');
-  if (errorEl) errorEl.remove();
-}
-
-function setLoading(button, loading) {
-  button.disabled = loading;
-  button.setAttribute('aria-busy', loading);
-  button.textContent = loading ? 'Signing in…' : 'Sign In';
-}
-
-function validateEmail(email) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-}
-
-async function handleSubmit(e, config) {
-  e.preventDefault();
-  const form = e.target;
-  const email = form.querySelector('#login-email').value.trim();
-  const password = form.querySelector('#login-password').value;
-  const submitBtn = form.querySelector('.login-submit');
-
-  clearError(form);
-
-  if (!email || !validateEmail(email)) {
-    showError(form, 'Please enter a valid email address.');
-    form.querySelector('#login-email').focus();
-    return;
-  }
-
-  if (!password || password.length < 6) {
-    showError(form, 'Password must be at least 6 characters.');
-    form.querySelector('#login-password').focus();
-    return;
-  }
-
-  setLoading(submitBtn, true);
-
-  try {
-    const action = config.action || '/api/login';
-    const response = await fetch(action, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password }),
-    });
-
-    if (!response.ok) {
-      const data = await response.json().catch(() => ({}));
-      throw new Error(data.message || 'Invalid email or password.');
-    }
-
-    // Successful login — redirect
-    const redirect = config.redirect || '/';
-    window.location.href = redirect;
-  } catch (err) {
-    showError(form, err.message || 'Something went wrong. Please try again.');
-    setLoading(submitBtn, false);
-  }
-}
+/* ── Helpers ─────────────────────────────────────────── */
 
 function parseConfig(block) {
   const config = {};
-  const rows = [...block.querySelectorAll(':scope > div')];
-
-  rows.forEach((row) => {
+  [...block.querySelectorAll(':scope > div')].forEach((row) => {
     const cells = row.querySelectorAll(':scope > div');
     if (cells.length >= 2) {
-      const key = cells[0].textContent.trim().toLowerCase();
-      const value = cells[1].textContent.trim();
-      config[key] = value;
+      config[cells[0].textContent.trim().toLowerCase()] = cells[1].textContent.trim();
     }
   });
-
   return config;
 }
 
-function buildLoginForm(config) {
-  const wrapper = document.createElement('div');
-  wrapper.className = 'login-wrapper';
+function qs(selector, root = document) {
+  return root.querySelector(selector);
+}
 
+function setStatus(card, type, message) {
+  let el = qs('.lgm-status', card);
+  if (!el) {
+    el = document.createElement('p');
+    el.className = 'lgm-status';
+    qs('.lgm-body', card).prepend(el);
+  }
+  el.className = `lgm-status lgm-status--${type}`;
+  el.textContent = message;
+  el.setAttribute('role', 'alert');
+}
+
+function clearStatus(card) {
+  qs('.lgm-status', card)?.remove();
+}
+
+/* ── Google Identity Services loader ─────────────────── */
+
+let gisReady = false;
+let gisCallbacks = [];
+
+function loadGIS() {
+  return new Promise((resolve) => {
+    if (gisReady) return resolve();
+    gisCallbacks.push(resolve);
+    if (qs('script[src*="accounts.google.com/gsi/client"]')) return;
+    const s = document.createElement('script');
+    s.src = 'https://accounts.google.com/gsi/client';
+    s.async = true;
+    s.defer = true;
+    s.onload = () => {
+      gisReady = true;
+      gisCallbacks.forEach((cb) => cb());
+      gisCallbacks = [];
+    };
+    document.head.append(s);
+  });
+}
+
+/* ── OAuth popup flow ─────────────────────────────────── */
+
+function buildOAuthURL(config) {
+  const params = new URLSearchParams({
+    client_id: config.clientid,
+    redirect_uri: window.location.origin + (config.callbackpath || '/auth/google/callback'),
+    response_type: 'code',
+    scope: config.scope || 'openid email profile',
+    access_type: 'offline',
+    prompt: 'select_account',
+  });
+  if (config.hd) params.set('hd', config.hd);
+  return `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
+}
+
+function popupLogin(config) {
+  return new Promise((resolve, reject) => {
+    const url = buildOAuthURL(config);
+    const w = 500, h = 620;
+    const left = Math.round(screen.width / 2 - w / 2);
+    const top = Math.round(screen.height / 2 - h / 2);
+    const popup = window.open(url, 'google-login', `width=${w},height=${h},left=${left},top=${top}`);
+
+    if (!popup) {
+      reject(new Error('Popup blocked. Please allow popups for this site.'));
+      return;
+    }
+
+    const timer = setInterval(() => {
+      try {
+        if (popup.closed) {
+          clearInterval(timer);
+          reject(new Error('Sign-in was cancelled.'));
+          return;
+        }
+        const href = popup.location.href;
+        if (href.includes(window.location.origin)) {
+          clearInterval(timer);
+          popup.close();
+          const params = new URL(href).searchParams;
+          if (params.get('error')) {
+            reject(new Error(params.get('error_description') || 'Google sign-in failed.'));
+          } else {
+            resolve({ code: params.get('code'), state: params.get('state') });
+          }
+        }
+      } catch {
+        /* cross-origin — still loading */
+      }
+    }, 300);
+  });
+}
+
+/* ── One Tap / GIS button (Google Identity Services) ──── */
+
+function renderGISButton(config, container, card) {
+  loadGIS().then(() => {
+    if (!window.google?.accounts?.id) {
+      setStatus(card, 'error', 'Google Sign-In library failed to load.');
+      return;
+    }
+
+    window.google.accounts.id.initialize({
+      client_id: config.clientid,
+      callback: (response) => handleCredentialResponse(response, config, card),
+      hosted_domain: config.hd || undefined,
+      auto_select: false,
+      cancel_on_tap_outside: true,
+    });
+
+    window.google.accounts.id.renderButton(container, {
+      theme: 'outline',
+      size: 'large',
+      shape: 'rectangular',
+      logo_alignment: 'left',
+      text: 'continue_with',
+      width: container.offsetWidth || 320,
+    });
+
+    // Also prompt One Tap if available
+    window.google.accounts.id.prompt();
+  });
+}
+
+function handleCredentialResponse(response, config, card) {
+  clearStatus(card);
+  if (!response.credential) {
+    setStatus(card, 'error', 'No credential returned from Google.');
+    return;
+  }
+
+  // Decode JWT payload (display purposes — server must verify signature)
+  try {
+    const payload = JSON.parse(atob(response.credential.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+
+    // Domain restriction check (client-side hint; enforce server-side too)
+    if (config.hd && payload.hd !== config.hd) {
+      setStatus(card, 'error', `Only @${config.hd} accounts are allowed.`);
+      return;
+    }
+
+    showUserPreview(card, payload);
+    sendCredentialToServer(response.credential, config, card, payload);
+  } catch {
+    setStatus(card, 'error', 'Failed to read Google credential.');
+  }
+}
+
+function showUserPreview(card, payload) {
+  const body = qs('.lgm-body', card);
+  let preview = qs('.lgm-user-preview', card);
+  if (!preview) {
+    preview = document.createElement('div');
+    preview.className = 'lgm-user-preview';
+    body.append(preview);
+  }
+  preview.innerHTML = `
+    ${payload.picture ? `<img src="${payload.picture}" alt="" class="lgm-avatar" width="48" height="48">` : ''}
+    <div class="lgm-user-info">
+      <span class="lgm-user-name">${payload.name || ''}</span>
+      <span class="lgm-user-email">${payload.email || ''}</span>
+    </div>
+    <span class="lgm-spinner" aria-hidden="true"></span>
+  `;
+}
+
+async function sendCredentialToServer(credential, config, card, payload) {
+  const action = config.action || '/api/auth/google';
+  try {
+    const res = await fetch(action, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ credential }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.message || 'Authentication failed. Please try again.');
+    }
+    setStatus(card, 'success', `Signed in as ${payload.email}. Redirecting…`);
+    setTimeout(() => {
+      window.location.href = config.redirect || '/';
+    }, 800);
+  } catch (err) {
+    qs('.lgm-user-preview', card)?.remove();
+    setStatus(card, 'error', err.message);
+  }
+}
+
+/* ── Fallback custom button (when clientid missing) ───── */
+
+function renderFallbackButton(config, container, card) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'lgm-btn';
+  btn.setAttribute('aria-label', config.buttonlabel || 'Continue with Google');
+  btn.innerHTML = `
+    <svg class="lgm-google-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" aria-hidden="true">
+      <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
+      <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
+      <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>
+      <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.35-8.16 2.35-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
+    </svg>
+    <span>${config.buttonlabel || 'Continue with Google'}</span>
+  `;
+
+  btn.addEventListener('click', async () => {
+    clearStatus(card);
+    btn.disabled = true;
+    btn.classList.add('lgm-btn--loading');
+
+    try {
+      if (config.flow === 'redirect') {
+        window.location.href = buildOAuthURL(config);
+        return;
+      }
+      const result = await popupLogin(config);
+      setStatus(card, 'success', 'Google sign-in successful. Redirecting…');
+      // Exchange code server-side
+      const res = await fetch(config.action || '/api/auth/google', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: result.code }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.message || 'Authentication failed.');
+      }
+      setTimeout(() => { window.location.href = config.redirect || '/'; }, 600);
+    } catch (err) {
+      setStatus(card, 'error', err.message);
+      btn.disabled = false;
+      btn.classList.remove('lgm-btn--loading');
+    }
+  });
+
+  container.append(btn);
+}
+
+/* ── Card builder ─────────────────────────────────────── */
+
+function buildCard(config) {
   const card = document.createElement('div');
-  card.className = 'login-card';
+  card.className = 'lgm-card';
+
+  // Brand logo area
+  const brand = document.createElement('div');
+  brand.className = 'lgm-brand';
+  brand.innerHTML = `
+    <svg class="lgm-brand-icon" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <rect width="28" height="28" rx="6" fill="#FA0F00"/>
+      <path d="M6 8.5L14 15.5L22 8.5V19.5C22 20.05 21.55 20.5 21 20.5H7C6.45 20.5 6 20.05 6 19.5V8.5Z" fill="white"/>
+      <path d="M6 8.5L14 15.5L22 8.5H6Z" fill="#FFCDD2"/>
+    </svg>
+    <span class="lgm-brand-name">Gmail Sign-In</span>
+  `;
 
   // Header
   const header = document.createElement('div');
-  header.className = 'login-header';
+  header.className = 'lgm-header';
+  header.innerHTML = `
+    <h1 class="lgm-title">${config.title || 'Sign in'}</h1>
+    <p class="lgm-subtitle">${config.subtitle || 'Use your Google account to continue'}</p>
+    ${config.hd ? `<p class="lgm-domain-badge">@${config.hd} accounts only</p>` : ''}
+  `;
 
-  const title = document.createElement('h1');
-  title.className = 'login-title';
-  title.textContent = config.title || 'Welcome Back';
+  // Button container
+  const body = document.createElement('div');
+  body.className = 'lgm-body';
 
-  const subtitle = document.createElement('p');
-  subtitle.className = 'login-subtitle';
-  subtitle.textContent = config.subtitle || 'Sign in to your account to continue';
+  const btnContainer = document.createElement('div');
+  btnContainer.className = 'lgm-btn-container';
 
-  header.append(title, subtitle);
+  body.append(btnContainer);
 
-  // Form
-  const form = document.createElement('form');
-  form.className = 'login-form';
-  form.setAttribute('novalidate', '');
+  // Privacy note
+  const privacy = document.createElement('p');
+  privacy.className = 'lgm-privacy';
+  privacy.innerHTML = `By signing in you agree to our <a href="${config.termsurl || '/terms'}">Terms</a> and <a href="${config.privacyurl || '/privacy'}">Privacy Policy</a>.`;
 
-  // Email field
-  const emailGroup = document.createElement('div');
-  emailGroup.className = 'login-field';
+  card.append(brand, header, body, privacy);
 
-  const emailLabel = document.createElement('label');
-  emailLabel.htmlFor = 'login-email';
-  emailLabel.className = 'login-label';
-  emailLabel.textContent = 'Email address';
+  // Render button strategy
+  if (config.clientid) {
+    renderGISButton(config, btnContainer, card);
+  } else {
+    renderFallbackButton(config, btnContainer, card);
+  }
 
-  const emailInput = document.createElement('input');
-  emailInput.type = 'email';
-  emailInput.id = 'login-email';
-  emailInput.name = 'email';
-  emailInput.className = 'login-input';
-  emailInput.placeholder = 'you@example.com';
-  emailInput.autocomplete = 'email';
-  emailInput.required = true;
-
-  emailGroup.append(emailLabel, emailInput);
-
-  // Password field
-  const passwordGroup = document.createElement('div');
-  passwordGroup.className = 'login-field';
-
-  const passwordHeader = document.createElement('div');
-  passwordHeader.className = 'login-field-header';
-
-  const passwordLabel = document.createElement('label');
-  passwordLabel.htmlFor = 'login-password';
-  passwordLabel.className = 'login-label';
-  passwordLabel.textContent = 'Password';
-
-  const forgotLink = document.createElement('a');
-  forgotLink.href = config.forgoturl || '/forgot-password';
-  forgotLink.className = 'login-forgot';
-  forgotLink.textContent = 'Forgot password?';
-
-  passwordHeader.append(passwordLabel, forgotLink);
-
-  const passwordInputWrapper = document.createElement('div');
-  passwordInputWrapper.className = 'login-password-wrapper';
-
-  const passwordInput = document.createElement('input');
-  passwordInput.type = 'password';
-  passwordInput.id = 'login-password';
-  passwordInput.name = 'password';
-  passwordInput.className = 'login-input';
-  passwordInput.placeholder = '••••••••';
-  passwordInput.autocomplete = 'current-password';
-  passwordInput.required = true;
-
-  const toggleBtn = document.createElement('button');
-  toggleBtn.type = 'button';
-  toggleBtn.className = 'login-toggle-password';
-  toggleBtn.setAttribute('aria-label', 'Show password');
-  toggleBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`;
-
-  toggleBtn.addEventListener('click', () => {
-    const isPassword = passwordInput.type === 'password';
-    passwordInput.type = isPassword ? 'text' : 'password';
-    toggleBtn.setAttribute('aria-label', isPassword ? 'Hide password' : 'Show password');
-  });
-
-  passwordInputWrapper.append(passwordInput, toggleBtn);
-  passwordGroup.append(passwordHeader, passwordInputWrapper);
-
-  // Remember me
-  const rememberGroup = document.createElement('div');
-  rememberGroup.className = 'login-remember';
-
-  const rememberLabel = document.createElement('label');
-  rememberLabel.className = 'login-checkbox-label';
-
-  const rememberInput = document.createElement('input');
-  rememberInput.type = 'checkbox';
-  rememberInput.id = 'login-remember';
-  rememberInput.name = 'remember';
-  rememberInput.className = 'login-checkbox';
-
-  const rememberText = document.createElement('span');
-  rememberText.textContent = 'Remember me for 30 days';
-
-  rememberLabel.append(rememberInput, rememberText);
-  rememberGroup.append(rememberLabel);
-
-  // Submit button
-  const submitBtn = document.createElement('button');
-  submitBtn.type = 'submit';
-  submitBtn.className = 'login-submit';
-  submitBtn.textContent = 'Sign In';
-
-  // Social divider
-  const divider = document.createElement('div');
-  divider.className = 'login-divider';
-  divider.innerHTML = '<span>or continue with</span>';
-
-  // Social buttons
-  const socialGroup = document.createElement('div');
-  socialGroup.className = 'login-social';
-
-  const socialProviders = [
-    {
-      name: 'Google',
-      icon: `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>`,
-    },
-    {
-      name: 'GitHub',
-      icon: `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0C5.374 0 0 5.373 0 12c0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23A11.509 11.509 0 0112 5.803c1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576C20.566 21.797 24 17.3 24 12c0-6.627-5.373-12-12-12z"/></svg>`,
-    },
-  ];
-
-  socialProviders.forEach(({ name, icon }) => {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'login-social-btn';
-    btn.setAttribute('aria-label', `Sign in with ${name}`);
-    btn.innerHTML = `${icon}<span>${name}</span>`;
-    btn.addEventListener('click', () => {
-      window.location.href = config[`${name.toLowerCase()}url`] || `/auth/${name.toLowerCase()}`;
-    });
-    socialGroup.append(btn);
-  });
-
-  // Sign up link
-  const signupRow = document.createElement('p');
-  signupRow.className = 'login-signup';
-  signupRow.innerHTML = `Don't have an account? <a href="${config.signupurl || '/signup'}" class="login-signup-link">Create one</a>`;
-
-  form.append(emailGroup, passwordGroup, rememberGroup, submitBtn, divider, socialGroup);
-  form.addEventListener('submit', (e) => handleSubmit(e, config));
-
-  card.append(header, form, signupRow);
-  wrapper.append(card);
-
-  return wrapper;
+  return card;
 }
+
+/* ── decorate (EDS entry point) ───────────────────────── */
 
 export default function decorate(block) {
   const config = parseConfig(block);
   block.innerHTML = '';
-  const loginUI = buildLoginForm(config);
-  block.append(loginUI);
+
+  const wrapper = document.createElement('div');
+  wrapper.className = 'lgm-wrapper';
+  wrapper.append(buildCard(config));
+  block.append(wrapper);
 }
